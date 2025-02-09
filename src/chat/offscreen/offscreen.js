@@ -2,9 +2,11 @@
 const strings = {
   // List of script paths required by the iframe
   scripts: ["src/background/websocket_utils.js", "src/chat/offscreen/bing_socket.js"],
-  // URL for the iframe source; uses Bing's favicon with a custom query parameter.
-  iframeSrc: "https://www.bing.com/sa/simg/favicon-trans-bg-blue-mg.ico?bing-chat-gpt-4-in-google",
+  // URL for the iframe source; uses Copilot's favicon instead of Bing's
+  iframeSrc: "https://copilot.microsoft.com/favicon.ico?copilot-chat",
 };
+
+const debug = (...args) => console.log('[Copilot Offscreen]', ...args);
 
 // Object to track the readiness of the socket script in the iframe.
 // It uses a setter to trigger a listener when its value changes and provides a promise
@@ -13,6 +15,7 @@ const socketScriptReady = {
   _val: false,
   _listener: () => {},
   set val(val) {
+    debug('Socket script ready state:', val);
     this._val = val;
     // Notify any awaiting functionality that the value has been set.
     this._listener(val);
@@ -27,24 +30,29 @@ const socketScriptReady = {
 };
 
 // Initiates the iframe setup by converting script paths to their full URLs.
+debug('Setting up iframe');
 setupIframe(strings.scripts.map((src) => chrome.runtime.getURL(src)));
 
 // ...
 // setupIframe function: Creates an iframe, sets up message listeners, and handles communication.
 function setupIframe(scripts) {
+  debug('Creating iframe');
   // Create the iframe element using the provided source URL.
   const iframe = createIframe(strings.iframeSrc);
 
   // Global event listener for messages from the iframe.
   window.addEventListener('message', ({data}) => {
+    debug('Received message:', data);
     // Use a switch-case to handle different message types.
     switch (data) {
       // When the iframe indicates its scripts are ready, inject the required scripts.
       case 'iframe-script-ready':
+        debug('Injecting scripts:', scripts);
         injectScriptToIframe(iframe, scripts);
         break;
       // When the socket script inside the iframe is ready, update the readiness flag.
       case 'socket-script-ready':
+        debug('Socket script is ready');
         socketScriptReady.val = true;
         break;
     }
@@ -76,6 +84,7 @@ function injectScriptToIframe(iframe, scripts) {
 // ...
 // onReceiveMessageFromExtension function: Handles messages sent from the Chrome extension.
 function onReceiveMessageFromExtension(message, _, sendResponse) {
+  debug('Received message from extension:', message);
   // Ignore messages not intended for the offscreen context.
   if (message.target !== 'offscreen') return;
   switch (message.action) {
@@ -95,6 +104,7 @@ function onReceiveMessageFromExtension(message, _, sendResponse) {
 // sendMessageToIframe function: Forwards a message to the iframe and awaits a reply.
 // It waits for the socket script to be ready before sending the message.
 async function sendMessageToIframe(message) {
+  debug('Sending message to iframe:', message);
   const iframe = document.querySelector('iframe');
   if (!iframe) {
     throw 'No iframe'; // Error if iframe is not found.
@@ -111,6 +121,7 @@ async function sendMessageToIframe(message) {
     // Listener for the response message containing the unique messageId.
     const messageHandler = (event) => {
       if (event.data && event.data.messageId === messageId) {
+        debug('Received response from iframe:', event.data.message);
         resolve(event.data.message);
         // Remove this event listener after receiving the expected message.
         window.removeEventListener('message', messageHandler);

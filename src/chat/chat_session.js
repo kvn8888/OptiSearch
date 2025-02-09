@@ -48,9 +48,11 @@ class ChatSession {
     if (!name)
       throw ChatSession.#nameError;
     this.name = name;
-    window.addEventListener('beforeunload', () => {
+    window.addEventListener('beforeunload', async (event) => {
       if (this.deleteConversationAfter) {
-        this.removeConversation();
+        // Add small delay to ensure the event has time to complete
+        event.preventDefault();
+        await this.removeConversation();
       }
     });
   }

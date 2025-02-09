@@ -1,18 +1,24 @@
 class BingChatSession extends ChatSession {
+  static debug = (...args) => console.log('[Copilot Session]', ...args);
+
   properties = {
     name: "Copilot",
-    link: "https://www.bing.com/search",
+    link: "https://copilot.microsoft.com/",
     icon: "src/images/copilot.png",
     local_icon: "copilot.png",
-    href: "https://www.bing.com/search?form=MY0291&OCID=MY0291&q=Copilot&showconv=1",
+    href: "https://copilot.microsoft.com/chat",
   }
   static errors = {
     session: {
-      code: 'BING_CHAT_SESSION',
-      url: 'https://login.live.com/login.srf?wa=wsignin1.0&wreply=https%3A%2F%2Fwww.bing.com%2Ffd%2Fauth%2Fsignin%3Faction%3Dinteractive%26provider%3Dwindows_live_id%26return_url%3Dhttps%3A%2F%2Fwww.bing.com%2F%3Fwlexpsignin%3D1%26src%3DEXPLICIT',
-      text: _t("Please login to Bing with your Microsoft account, then refresh"),
-      button: _t("Login to $AI$", "Bing"),
+      code: 'COPILOT_SESSION',
+      url: 'https://copilot.microsoft.com/chat',
+      text: _t("Please wait while we open Microsoft Copilot for authentication..."),
+      button: _t("Open Copilot"),
     },
+    auth: {
+      code: 'COPILOT_AUTH',
+      text: _t("Authentication in progress. Please complete the login in the opened tab."),
+    }
   }
   static get storageKey() {
     return "SAVE_BINGCHAT";
@@ -35,64 +41,142 @@ class BingChatSession extends ChatSession {
     super('bingchat');
     this.socketID = null;
     this.uuid = generateUUID(); // for conversation continuation
+    this.retryCount = 0;
+    this.maxRetries = 3;
+    this.reconnectDelay = 1000; // Start with 1 second delay
+    
+    // Attempt to restore session on startup
+    this.restoreSession();
+    
+    // Listen for auth completion with token
+    chrome.runtime.onMessage.addListener((message) => {
+      if (message.action === 'auth-complete' && message.data?.accessToken) {
+        BingChatSession.debug('Auth completed with token, updating session');
+        this.session = {
+          accessToken: message.data.accessToken,
+          conversationId: generateUUID(),
+          isStartOfSession: true
+        };
+        // Save the new session
+        this.saveSession();
+        // Retry the conversation
+        this.setupAndSend();
+      }
+    });
+
+    // Handle visibility changes
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+          BingChatSession.debug('Tab became visible, checking session');
+          this.restoreSession();
+        }
+      });
+    }
   }
 
   async init() {
+    BingChatSession.debug('Initializing session');
     if (ChatSession.debug) return;
-    await this.fetchSession();
+    try {
+      await this.fetchSession();
+      BingChatSession.debug('Session initialized successfully');
+    } catch (error) {
+      BingChatSession.debug('Session initialization failed:', error);
+      throw error;
+    }
   }
 
   async fetchSession() {
+    BingChatSession.debug('Fetching session');
     const sessionURL = await this.parseSessionFromURL();
     if (sessionURL) {
+      BingChatSession.debug('Found session from URL');
       this.isContinueSession = true;
       this.session = sessionURL;
       return this.session;
     }
 
-    const session = await BingChatSession.offscreenAction({ action: "session" });
-    if (session.result?.value === 'UnauthorizedRequest')
-      throw BingChatSession.errors.session;
-    this.session = session;
-    this.session.isStartOfSession = true;
-    return this.session;
+    try {
+      BingChatSession.debug('Requesting authentication');
+      const response = await chrome.runtime.sendMessage({ action: 'copilot-auth' });
+      BingChatSession.debug('Auth response:', response?.success);
+
+      if (!response.success) {
+        if (response.error === 'Authentication required') {
+          BingChatSession.debug('Authentication required, waiting for login');
+          throw { ...BingChatSession.errors.auth, message: response.error };
+        }
+        throw BingChatSession.errors.session;
+      }
+
+      if (!response.data?.accessToken) {
+        BingChatSession.debug('No access token in response');
+        throw BingChatSession.errors.session;
+      }
+
+      this.session = {
+        accessToken: response.data.accessToken,
+        conversationId: this.uuid,
+        isStartOfSession: true
+      };
+      
+      // Save the new session
+      await this.saveSession();
+      
+      BingChatSession.debug('Session created successfully');
+      return this.session;
+    } catch (error) {
+      BingChatSession.debug('Session fetch error:', error);
+      throw error;
+    }
   }
 
   async parseSessionFromURL() {
-    if (!window.location.hostname.endsWith('.bing.com'))
+    if (!window.location.hostname.endsWith('.microsoft.com'))
       return;
-    const continuesession = new URL(window.location.href).searchParams.get('continuesession');
-    if (!continuesession)
+    
+    const params = new URLSearchParams(window.location.search);
+    const continueSession = params.get('continuesession');
+    if (!continueSession)
       return;
-    const session = await bgWorker({ action: 'session-storage', type: 'get', key: continuesession });
+
+    const session = await bgWorker({ action: 'session-storage', type: 'get', key: continueSession });
     if (!session || session.inputText !== parseSearchParam())
       return;
+    
     return session;
   }
 
   async send(prompt) {
     super.send(prompt);
-    if (ChatSession.debug) {
-      return;
+    if (ChatSession.debug) return;
+
+    try {
+      this.bingIconElement?.classList.add('disabled');
+      this.socketID = await this.createSocket();
+      
+      await this.socketSend({
+        event: "send",
+        conversationId: this.session.conversationId,
+        content: [{ type: "text", text: prompt }],
+        mode: "chat"
+      });
+
+      return this.next();
+    } catch (error) {
+      BingChatSession.debug('Send error:', error);
+      // Clear the socket ID so we create a new one on retry
+      this.socketID = null;
+      await this.handleActionError(error);
+      
+      // Only retry if it's an authentication error
+      if (error?.message === 'Authentication required') {
+        BingChatSession.debug('Waiting for authentication to complete...');
+        // The auth handler will trigger a retry
+        return;
+      }
     }
-    this.bingIconElement?.classList.add('disabled');
-
-    bgWorker({
-      action: 'session-storage', type: 'set', key: this.uuid,
-      value: { ...this.session, inputText: prompt }
-    });
-
-    this.socketID = await this.createSocket();
-    const { packet } = await this.socketReceive();
-    if (packet !== '{}\x1e') {
-      this.onErrorMessage();
-      err(`Error with Bing Copilot: first packet received is ${packet}`);
-      return;
-    }
-
-    await this.socketSend({ "type": 6 });
-    await this.socketSend(await this.config(prompt));
-    return this.next();
   }
 
   createPanel(directchat = true) {
@@ -142,149 +226,209 @@ class BingChatSession extends ChatSession {
   }
 
   async next() {
-    const res = await this.socketReceive();
-    if (!res) {
-      return;
-    }
-    /**@type {{packet: string, readyState: number}} */
-    const { packet, readyState } = res;
-    this.session.isStartOfSession = false;
+    try {
+      const res = await this.socketReceive();
+      if (!res) return;
 
-    /**
-     * body.type: 1 = Invocation, 2 = StreamItem, 3 = Completion, 4 = StreamInvocation, 5 = CancelInvocation, 6 = Ping, 7 = Close
-     * @param {*} body 
-     * @returns 
-     */
-    const parseResponseBody = (body) => {
-      let msg = null;
-      switch (body.type) {
-        case 1: msg = body.arguments[0]?.messages && body.arguments[0]?.messages[0]; break;
-        case 2:
-          if (!body.item) {
-            this.onErrorMessage();
-            return;
-          }
-          if (body.item.result) {
-            if (body.item.result.value === 'Throttled') {
-              this.onErrorMessage(_t("Sorry, you've reached the limit of messages you can send to Copilot within 24 hours. Check back soon!"));
-              return;
-            }
-            if (body.item.result.value === 'UnauthorizedRequest') {
-              this.onErrorMessage(body.item.result?.message);
-              return;
-            }
-            if (body.item.result.error) {
-              if (body.item.result.error === 'UnauthorizedRequest' || body.item.result.value === 'CaptchaChallenge')
-                throw BingChatSession.errors.session;
-            }
-            if (body.item.result.value !== 'Success' && body.item.result.message) {
-              this.onMessage(ChatSession.infoHTML(body.item.result.message));
-              return;
-            }
-          }
-          if (!body.item.messages) {
-            this.onErrorMessage();
-            return;
-          }
-          msg = body.item.messages.find(m => !m.messageType && m.author === 'bot');
-          break;
-        case 6:
-          this.socketSend({ "type": 6 });
-          return;
-        case 3: case 7:
-          this.allowSend();
-          return 'close';
-        default: return;
-      }
-      const validTypes = ['InternalSearchQuery', undefined];
-      if (!(msg && validTypes.some(t => t === msg.messageType)))
-        return;
-
-      if (msg.messageType === 'InternalSearchQuery') {
-        this.onMessage(ChatSession.infoHTML(`🔍 ${msg.text.replace(/`([^`]*)`/, '<strong>$1</strong>')}`));
-        return;
-      }
-      const refText = msg.adaptiveCards && msg.adaptiveCards[0]?.body.find(x => x.text && x.text.startsWith("[1]: http"))?.text;
-      const refs = refText?.split('\n')
-        .map(s => s.match(/\[(\d+)]: (http[^ ]+) \"(.*)\"/)) // parse links
-        .filter(r => !!r).map(([_, n, href, title]) => ({ n, href, title })) ?? [];
-      const learnMore = msg.adaptiveCards && msg.adaptiveCards[0]?.body.find(x => x.text && x.text.startsWith("Learn more:"))?.text;
-      let text = msg.text || msg.spokenText;
-      if (!text) return;
-      const sources = {};
-      if (learnMore) {
-        [...learnMore.matchAll(/\[(\d+)\. [^\]]+\]\(([^ ]+)\) ?/g)].forEach(([_, n, href]) => sources[href] = n);
-        text = text.replace(/\[\^(\d+)\^\]/g, '\uF8FD$1\uF8Fe');
-      }
-
-      const bodyHTML = runMarkdown(text)
-        .replace(/\uF8FD(\d+)\uF8FE/g, (_, nRef) => {
-          const ref = refs.find(r => r.n == nRef);
-          if (!ref) return '';
-          return `<a href="${ref.href}" title="${ref.title}" class="source superscript">${sources[ref.href]}</a>`;
-        })
-        .replace(/href="(?:\^|<sup>)(\d+)(?:\^|<\/sup>)"/g, (_, nRef) => {
-          const ref = refs.find(r => r.n == nRef);
-          if (!ref) return '';
-          return `href="${ref.href}"`;
-        });
-        
-      this.onMessage(
-        bodyHTML,
-        Object.entries(sources).map(([href, index]) => ({ index, href })),
-      );
-    }
-    const doClose = packet.split('\x1e')
-      .slice(0, -1)
-      .map(json => json.replaceAll('\n', '\\n'))
-      .map(json => {
-        try {
-          return JSON.parse(json);
-        } catch (e) {
-          console.warn(e, json);
-          return;
+      const { packet, readyState } = res;
+      BingChatSession.debug('Socket state:', readyState, 'Received:', packet?.substring(0, 100));
+      
+      if (readyState !== WebSocket.OPEN) {
+        BingChatSession.debug('Socket not open, attempting reconnect');
+        if (this.retryCount < this.maxRetries) {
+          this.socketID = null; // Force new socket creation
+          this.socketID = await this.createSocket();
+          return this.next();
         }
-      })
-      .map(parseResponseBody)
-      .find(x => x === 'close');
+        throw new Error("WebSocket connection lost");
+      }
 
-    if (doClose || readyState === WebSocket.CLOSED)
-      return;
+      const messages = packet.split('\x1e')
+        .filter(line => line.trim())
+        .map(line => {
+          try {
+            return JSON.parse(line);
+          } catch (e) {
+            BingChatSession.debug('Message parse error:', e, line);
+            return null;
+          }
+        })
+        .filter(msg => msg);
 
-    return this.next();
+      for (const msg of messages) {
+        BingChatSession.debug('Processing message:', msg.event);
+        switch (msg.event) {
+          case 'appendText':
+            this.onMessage(msg.text);
+            break;
+          case 'error':
+            if (msg.error?.includes('token')) {
+              BingChatSession.debug('Token error, refreshing session');
+              this.session = null;
+              await this.init();
+              this.socketID = await this.createSocket();
+              return this.next();
+            }
+            throw msg;
+          case 'disconnect':
+            if (this.retryCount < this.maxRetries) {
+              BingChatSession.debug('Received disconnect, attempting reconnect');
+              this.socketID = null;
+              this.socketID = await this.createSocket();
+              return this.next();
+            }
+            throw new Error("Connection terminated by server");
+          case 'suggestedFollowups':
+            this.suggestions = msg.suggestions;
+            break;
+          case 'done':
+            BingChatSession.debug('Conversation complete');
+            this.allowSend();
+            return;
+        }
+      }
+      
+      return this.next();
+    } catch (error) {
+      BingChatSession.debug('Next error:', error);
+      await this.handleActionError(error);
+    }
   }
 
-  removeConversation() {
+  async saveSession() {
+    if (!this.session) return;
+    
+    try {
+      await chrome.storage.local.set({
+        'copilot_session': {
+          accessToken: this.session.accessToken,
+          timestamp: Date.now()
+        }
+      });
+      BingChatSession.debug('Session saved');
+    } catch (error) {
+      BingChatSession.debug('Failed to save session:', error);
+    }
+  }
+
+  async restoreSession() {
+    try {
+      const data = await chrome.storage.local.get('copilot_session');
+      const saved = data.copilot_session;
+      
+      if (saved && Date.now() - saved.timestamp < 3600000) { // 1 hour
+        BingChatSession.debug('Restoring saved session');
+        this.session = {
+          accessToken: saved.accessToken,
+          conversationId: generateUUID(),
+          isStartOfSession: true
+        };
+      } else if (saved) {
+        // Clear expired session
+        await chrome.storage.local.remove('copilot_session');
+      }
+    } catch (error) {
+      BingChatSession.debug('Failed to restore session:', error);
+    }
+  }
+
+  async removeConversation() {
     if (ChatSession.debug || !this.session)
-      return;
-    const { conversationSignature, clientId, conversationId } = this.session;
-    return BingChatSession.offscreenAction({
-      action: "delete",
-      conversationSignature,
-      clientId,
-      conversationId,
-    });
+      return Promise.resolve();
+      
+    // Clean up WebSocket connection with retry
+    if (this.socketID != null) {
+      try {
+        const result = await BingChatSession.offscreenAction({
+          action: "socket",
+          socketID: this.socketID,
+          toSend: JSON.stringify({ event: "close" }) + '\x1e'
+        });
+
+        if (result.error) {
+          BingChatSession.debug('Error closing WebSocket:', result.error);
+          // Socket might already be closed, continue with cleanup
+        }
+
+        // Wait a bit to ensure the socket is fully closed
+        await new Promise(resolve => setTimeout(resolve, 100));
+        this.socketID = null;
+      } catch (error) {
+        BingChatSession.debug('Failed to close WebSocket:', error);
+      }
+    }
+
+    // Clear stored session on explicit removal
+    try {
+      await chrome.storage.local.remove('copilot_session');
+      BingChatSession.debug('Session removed');
+    } catch (error) {
+      BingChatSession.debug('Failed to remove session:', error);
+    } finally {
+      // Clear in-memory session state
+      this.session = null;
+      this.retryCount = 0;
+      this.reconnectDelay = 1000;
+    }
+    
+    return Promise.resolve();
   }
 
   async createSocket() {
-    let url = 'wss://sydney.bing.com/sydney/ChatHub';
-    if ('sec_access_token' in this.session) {
-      url += `?sec_access_token=${encodeURIComponent(this.session['sec_access_token'])}`;
+    if (!this.session?.accessToken) {
+      BingChatSession.debug('No access token available');
+      throw BingChatSession.errors.session;
     }
-    const res = await BingChatSession.offscreenAction({
-      action: "socket",
-      url,
-      toSend: JSON.stringify({ "protocol": "json", "version": 1 }) + '\x1e',
-    });
-    if (!('socketID' in res)) {
-      throw "Socket ID not returned";
+
+    try {
+      const url = `wss://copilot.microsoft.com/c/api/chat?api-version=2&accessToken=${encodeURIComponent(this.session.accessToken)}`;
+      BingChatSession.debug('Creating WebSocket:', url);
+      
+      const res = await BingChatSession.offscreenAction({
+        action: "socket",
+        url,
+        headers: {
+          'Origin': 'https://copilot.microsoft.com',
+          'Sec-WebSocket-Protocol': 'chat'
+        },
+        toSend: JSON.stringify({
+          event: "setOptions",
+          supportedCards: ["image"],
+          ads: { supportedTypes: ["multimedia", "product", "tourActivity", "propertyPromotion", "text"] }
+        }) + '\x1e'
+      });
+
+      if (!('socketID' in res)) {
+        BingChatSession.debug('Failed to get socket ID:', res);
+        if (res.error?.includes('not in OPEN state')) {
+          // Connection failed to establish, retry auth
+          this.session = null;
+          throw BingChatSession.errors.session;
+        }
+        throw new Error("Failed to create WebSocket connection");
+      }
+
+      BingChatSession.debug('Socket created successfully:', res.socketID);
+      this.retryCount = 0;
+      return res.socketID;
+    } catch (error) {
+      this.retryCount++;
+      BingChatSession.debug(`Socket creation failed (attempt ${this.retryCount}):`, error);
+      if (this.retryCount < this.maxRetries) {
+        const delay = Math.min(1000 * Math.pow(2, this.retryCount), 5000);
+        BingChatSession.debug(`Retrying in ${delay}ms`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return this.createSocket();
+      }
+      throw error;
     }
-    return res.socketID;
   }
 
   socketSend(body) {
-    if (this.socketID == null)
+    if (this.socketID == null) {
       throw "Need socket ID to send";
+    }
+    // Add record separator for message framing
     return BingChatSession.offscreenAction({
       action: "socket",
       socketID: this.socketID,
@@ -292,9 +436,11 @@ class BingChatSession extends ChatSession {
     });
   }
 
-  socketReceive() {
-    if (this.socketID == null)
-      throw "Need socket ID to receive";
+  async socketReceive() {
+    if (this.socketID == null) {
+      BingChatSession.debug('No socket ID available, creating new socket');
+      this.socketID = await this.createSocket();
+    }
     return BingChatSession.offscreenAction({
       action: "socket",
       socketID: this.socketID,
@@ -314,70 +460,62 @@ class BingChatSession extends ChatSession {
   async config(prompt) {
     if (!this.session)
       throw "Session has to be fetched first";
-    const { conversationSignature, clientId, conversationId, isStartOfSession } = this.session;
-
-    const timestamp = () => {
-      const pad0 = (n) => n < 10 ? "0" + n : n;
-      let t = (new Date).getTimezoneOffset(), hOff = Math.floor(Math.abs(t / 60)), mOff = Math.abs(t % 60);
-      let end = '';
-      if (t < 0)
-        end = "+" + pad0(hOff) + ":" + pad0(mOff);
-      else if (t > 0)
-        end = "-" + pad0(hOff) + ":" + pad0(mOff);
-      else if (t == 0)
-        end = "Z";
-      const now = new Date;
-      const d = now.getDate(), mo = now.getMonth() + 1, y = now.getFullYear(),
-        h = now.getHours(), m = now.getMinutes(), s = now.getSeconds();
-      return `${pad0(y)}-${pad0(mo)}-${pad0(d)}T${pad0(h)}:${pad0(m)}:${pad0(s)}${end}`;
-    }
-
-    const { sliceIds, optionsSets } = {
-      sliceIds: ["tnaenableux", "adssqovr", "tnaenable", "0731ziv2s0", "lessttscf", "creatordevcf", "inosanewsmob", "wrapnoins", "gbacf", "wrapuxslimc", "prehome", "sydtransl", "918raianno", "713logprobss0", "926bof108t525", "806log2sph", "927uprofasys0", "919vidsnips0", "917fluxv14"],
-      optionsSets: ["nlu_direct_response_filter", "deepleo", "disable_emoji_spoken_text", "responsible_ai_policy_235", "enablemm", "dv3sugg", "autosave", "iyxapbing", "iycapbing", "saharagenconv5", "bof108t525", "log2sph", "eredirecturl"]
-    };
-
-    const convStyle = {
-      'creative': ["h3imaginative", "clgalileo", "gencontentv3"],
-      'balanced': ["galileo"],
-      'precise': ["h3precise", "clgalileo", "gencontentv3"],
-    }[Context.get('bingConvStyle')];
-
-    if (convStyle) {
-      optionsSets.push(...convStyle);
-    }
-
-    if (!(await this.internalSearchActivated())) {
-      optionsSets.push("nosearchall");
-    }
-
+    
     return {
-      arguments: [{
-        source: "cib",
-        sliceIds,
-        optionsSets,
-        allowedMessageTypes: [
-          "Chat",
-          "InternalSearchQuery",
-        ],
-        verbosity: "verbose",
-        isStartOfSession,
-        message: {
-          timestamp: timestamp(),
-          author: "user",
-          inputMethod: "Keyboard",
-          text: prompt,
-          messageType: "Chat"
-        },
-        conversationSignature,
-        participant: {
-          id: clientId,
-        },
-        conversationId
-      }],
-      invocationId: "0",
-      target: "chat",
-      type: 4,
+      event: "send",
+      conversationId: this.session.conversationId || this.uuid,
+      content: [{ type: "text", text: prompt }],
+      mode: "chat"
+    };
+  }
+
+  async handleActionError(error) {
+    this.lastError = error;
+    
+    if (error?.message === 'Authentication required') {
+      BingChatSession.debug('Handling auth error, showing message');
+      this.onErrorMessage(BingChatSession.errors.auth);
+      // Don't clear session here as we might get a token in auth-complete
+      return;
+    }
+
+    if (error?.message?.includes('WebSocket not in OPEN state') || 
+        error?.message?.includes('WebSocket connection lost')) {
+      BingChatSession.debug('Connection lost, will retry with new session');
+      this.session = null;
+      this.socketID = null;
+    }
+    
+    if (error && error.code && error.text) {
+      this.setCurrentAction(error.action ?? 'window');
+    }
+    this.onErrorMessage(error);
+  }
+
+  async setupAndSend(prompt) {
+    if (!this.sendingAllowed) return;
+    
+    prompt = prompt ?? parseSearchParam();
+    BingChatSession.debug('Setting up conversation with prompt:', prompt);
+
+    this.setCurrentAction(null);
+    this.disableSend();
+    this.discussion.appendMessage(new MessageContainer(Author.User, escapeHtml(prompt)));
+    this.discussion.appendMessage(new MessageContainer(Author.Bot, ''));
+    this.onMessage(ChatSession.infoHTML(_t("Waiting for <strong>$AI$</strong>...", this.properties.name)));
+    
+    try {
+      if (!this.canSend()) {
+        BingChatSession.debug('No session available, initializing...');
+        await this.init();
+      }
+      if (this.canSend()) {
+        BingChatSession.debug('Session ready, sending message');
+        await this.send(prompt);
+      }
+    } catch (error) {
+      BingChatSession.debug('Setup error:', error);
+      await this.handleActionError(error);
     }
   }
 }
